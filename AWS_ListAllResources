@@ -1,0 +1,246 @@
+#!/usr/bin/python
+# coding=UTF-8
+
+# Sample code to list resources across regions and AWS accounts through cross-account access
+# Resources currently implemented :
+# - EC2 instances
+# - EBS volumes and snapshots
+# - RDS DB instances
+# - S3 buckets
+
+# Optional for delegated accounts :
+# 
+# Format of the JSON file required by the --trusting_accounts_file argument :
+#
+#  
+# {
+#     "Accounts": [
+#         {
+#             "accountName": "How you want to name your first trusting account",
+#             "accountID": "12-digit-no-hyphens",
+#             "accountRole": "Role you created in the first account",
+#             "externalID": "Optional external ID"
+#         },
+#         {
+#             "accountName": "How you want to name your second trusting account",
+#             "accountID": "12-digit-no-hyphens",
+#             "accountRole": "Role you created in the second account",
+#             "externalID": "Optional external ID"
+#         }
+#     ]
+# }
+#
+# General help with cross-account access and assuming roles : http://amzn.to/1cpwmbv  
+# Help with the externalID : http://amzn.to/1fKZiiJ
+#
+
+__author__ = 'Jason McDonald'
+__credits__ = ["AWS ProServe"]
+__version__ = "1.0"
+__email__ = "mcdojaso@amazon.com"
+__status__ = "Sample"
+
+import boto.ec2
+import boto.rds
+import boto.s3
+import boto.sts
+import argparse
+import json
+from json.encoder import JSONEncoder
+import time
+
+parser = argparse.ArgumentParser(description='Lists resources across regions and AWS accounts through cross-account access')
+parser.add_argument('-a', '--access_key_id', help='not needed if specified via config file or environment variables.')
+parser.add_argument('-k', '--secret_access_key', help='not needed if specified via config file or environment variables.')
+parser.add_argument('-p', '--profile', help='profile specified in the .boto file. This is an alternative to passing the credentials as parameters and to envirnoment variables.')
+parser.add_argument('-t', '--trusting_accounts_file', default="None", help='json file containing trusting accounts description')
+parser.add_argument('-o', '--output', default="console", help='default output is "console". Other possible outputs are : "json"')
+parser.add_argument('-f', '--output_filename', default="listallresources-" + str(time.time()) + ".json" , help='output filename')
+
+args = parser.parse_args()
+access_key_id = args.access_key_id
+secret_access_key = args.secret_access_key
+trusting_accounts_file = args.trusting_accounts_file 
+output = args.output
+output_filename = args.output_filename
+profile = args.profile
+
+#These variables contain a tree made up of chained dicts, that will be used
+#to generate the output (json or other)
+global_current_dict = {}
+global_output_dict = global_current_dict    
+global_dict_stack = [global_output_dict]
+
+def do_output(output_key, output_value=None, up_or_down=None):
+    global global_current_dict, global_dict_stack
+    if (up_or_down == "down"):
+        global_current_dict[str(output_key)] = dict()
+        global_dict_stack.append(global_current_dict)
+        global_current_dict = global_current_dict[output_key]     
+    elif (up_or_down == "up"):
+        global_current_dict = global_dict_stack.pop()
+    elif output_value != None:
+        global_current_dict[output_key] = output_value   
+        
+    depth = len(global_dict_stack)
+    arrow = ""
+    while depth > 1:
+        arrow += "-"
+        depth -= 1
+    if (up_or_down == "down"):
+        print arrow + ">" + output_key 
+    elif output_value != None:
+        print arrow + "->" + output_key + ":" + str(output_value)
+
+def do_trace(text):
+    print text
+    
+def output_branch(branch_name, branch_object, branch_attribute, *argv):
+    """Choose the object attributes you want to output, starting with the fourth argument"""
+    do_output(branch_name, up_or_down="down")
+    for leaf in branch_object:
+        do_output(getattr(leaf,branch_attribute), up_or_down="down")
+        for leaf_attribute in argv:
+            do_output(leaf_attribute, getattr(leaf,leaf_attribute))
+        do_output(getattr(leaf,branch_attribute), up_or_down="up")
+    do_output(branch_name, up_or_down="up")
+
+def no_credentials():
+    do_trace("-->Please check your credentials! Use a config file or the -a and -k options")
+    raise SystemExit(0)
+
+def list_resources(account_access_key_id = access_key_id,
+                  account_secret_access_key = secret_access_key,
+                  account_security_token = "",
+                  account_name = "",
+                  account_id = "",
+                  profile_name = ""):
+    do_output(account_name, up_or_down="down")
+    do_output("account_id", account_id)
+    regions = boto.ec2.regions()
+    do_output("Regions", up_or_down="down")
+    for regionInfo in regions:
+        do_output(regionInfo.name, up_or_down="down")
+        
+        #EC2
+        try:
+            connection = boto.ec2.connect_to_region(regionInfo.name, aws_access_key_id = account_access_key_id,
+                    aws_secret_access_key = account_secret_access_key, security_token = account_security_token,
+                    profile_name=profile)
+         
+            regionInstances = connection.get_only_instances()
+            do_output("EC2", up_or_down="down")
+            
+            output_branch("Instances", regionInstances, "id", "instance_type", "platform", "image_id")
+            
+            do_output("EBS", up_or_down="down")           
+            
+            regionVolumes = connection.get_all_volumes()
+            
+            output_branch("Volumes", regionVolumes, "id", "size", "zone", "status")
+         
+            regionSnapshots = connection.get_all_snapshots(owner="self")
+            do_output("Snapshots", up_or_down="down")
+            for snapshot in regionSnapshots:
+                do_output("id", snapshot.id)
+            do_output("Snapshots", up_or_down="up")
+            
+            do_output("EBS", up_or_down="up")
+            
+            do_output("EC2", up_or_down="up")
+            
+        except boto.exception.EC2ResponseError:
+            do_trace("EC2 : Unable to connect to this region")
+        except boto.exception.NoAuthHandlerFound:
+            no_credentials()
+        
+        #RDS
+        try:
+            rdsConnection = boto.rds.connect_to_region(regionInfo.name, aws_access_key_id = account_access_key_id,
+                    aws_secret_access_key = account_secret_access_key, security_token = account_security_token,
+                    profile_name=profile)
+            
+            regionRDSInstances = rdsConnection.get_all_dbinstances()
+            
+            output_branch("RDS", regionRDSInstances, "id", "instance_class", "engine", "allocated_storage")
+
+        except boto.exception.BotoServerError:
+            do_trace("RDS: Unable to connect to this region")
+        except boto.exception.NoAuthHandlerFound:
+            no_credentials()
+        
+        do_output(regionInfo.name, up_or_down="up")
+        
+    do_output("Regions", up_or_down="up")
+            
+    #S3 - we only try one region
+    try:
+        s3Connection = boto.s3.connect_to_region('eu-west-1', aws_access_key_id = account_access_key_id,
+                aws_secret_access_key = account_secret_access_key, security_token = account_security_token,
+                profile_name=profile)
+        do_output("S3", up_or_down="down")
+        regionS3Buckets = s3Connection.get_all_buckets()
+        for bucket in regionS3Buckets:
+            do_output(bucket.name, up_or_down="down")
+            bucket_location = bucket.get_location()
+            bucket_region = bucket_location
+            if bucket_location == "EU":
+                bucket_region = "eu-west-1"
+            elif bucket_location == "":
+                bucket_region = "us-east-1"
+            do_output("LocationConstraint", bucket_location)
+            do_output("region", bucket_region)
+            do_output(bucket.name, up_or_down="up")      
+    except boto.exception.S3ResponseError:
+        do_trace("S3 : Response error")
+    except boto.exception.NoAuthHandlerFound:
+            no_credentials()
+    do_output("S3", up_or_down="up")      
+    do_output(account_name, up_or_down="up")
+
+#Main script
+do_trace("Start of script")
+if output == "console":
+    do_trace("Output:console")
+elif output == "json":
+    do_trace("Output:json")
+else:
+    raise Exception(output + " output not implemented!")
+
+#List main account
+list_resources(account_name = "Main account",account_id ="N/A", profile_name=profile)
+
+# List trusting accounts
+#
+# The calls to AWS STS AssumeRole must be signed using the access key ID and secret
+# access key of an IAM user or using existing temporary credentials. (You cannot call
+# AssumeRole using the access key for an account.)
+
+
+if trusting_accounts_file != "None":
+    trustAccountsFile = open(trusting_accounts_file,"r")
+    trustAccountsData = json.loads(trustAccountsFile.read())
+    for trustAccount in trustAccountsData['Accounts']:
+        sessionIndex = 0
+        sts_connection = boto.sts.connect_to_region('eu-west-1', profile_name=profile)
+        assumedRoleObject = sts_connection.assume_role(
+            role_arn="arn:aws:iam::" + trustAccount['accountID']+ ":role/" + trustAccount['accountRole'],
+            role_session_name="AssumeRole" + str(sessionIndex),
+            external_id=trustAccount['externalID']
+        )
+        sessionIndex += 1
+        list_resources(account_access_key_id = assumedRoleObject.credentials.access_key,
+                      account_secret_access_key = assumedRoleObject.credentials.secret_key,
+                      account_security_token = assumedRoleObject.credentials.session_token,
+                      account_name = trustAccount['accountName'],
+                      account_id = trustAccount['accountID'])
+
+if output == 'json':
+    do_trace("Starting json encoding")
+    encoder = JSONEncoder(separators=(',', ': '), indent=4)
+    output_file = open(output_filename, "w")
+    output_file.write(encoder.encode(global_output_dict))
+    output_file.close()
+    do_trace("json encoded terminated. Filename = " + output_filename)
+
+do_trace("End of script")
